@@ -1,5 +1,14 @@
 # CasioCGM
 
+> **This copy (CasioCGM AAPS)** is an unofficial, private DIY copy of
+> [sgitaize/casiocgm](https://github.com/sgitaize/casiocgm) (MIT), not made or endorsed by its
+> author, by Core Devices or by the AndroidAPS project. It adds the AAPS link (`src/c/aaps_link.c`):
+> the face sends the watch's steps and heart rate to an AAPS fork with a Pebble plugin, and shows the
+> glucose, IOB and COB that AAPS sends back. When AAPS has the newer reading, the glucose box shows
+> it; the yellow banner shows IOB and COB while its label is the default one. Low/high vibration and
+> the fetch watchdog still come from Nightscout only. Display only: nothing on the watch can make
+> AAPS act. Not a medical device. It has its own UUID, so it installs next to the original face.
+
 A retro Casio-style LCD watchface for the **Pebble Time 2**, with real-time **Nightscout CGM** blood glucose integration.
 
 > As a diabetic you want a cool watchface too — not just a plain number on a screen. That is why CasioCGM exists.
@@ -161,3 +170,6 @@ If you find CasioCGM useful, a small donation is always appreciated!
 ## License
 
 MIT — do whatever you want, attribution appreciated.
+
+In this copy, `src/c/aaps_link.c` and `src/c/aaps_link.h` come from the private aaps-pebble
+repository; their author provides them here under the MIT licence too.

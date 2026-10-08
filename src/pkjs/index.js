@@ -527,6 +527,7 @@ Pebble.addEventListener('showConfiguration', function() {
 });
 
 Pebble.addEventListener('appmessage', function(e) {
+  if (e.payload && e.payload['1094799361'] !== undefined) return;  // AAPS link snapshot, for AAPS only
   console.log('[CasioCGM] Message from watch: ' + JSON.stringify(e.payload));
   // Watch requests an immediate BG fetch (e.g. after BT reconnect)
   if (e.payload && (e.payload[K.REQUEST_BG] !== undefined ||

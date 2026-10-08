@@ -8,9 +8,19 @@
   "private": true,
   "dependencies": {},
   "pebble": {
-    "displayName": "CasioCGM",
-    "uuid": "6a8bead9-d7d1-4183-bbb6-e351208ac33f",
+    "displayName": "CasioCGM AAPS",
+    "uuid": "3d2909a9-83b0-4550-9a14-1be2dd3e5389",
     "sdkVersion": "3",
+    "companionApp": {
+      "android": {
+        "url": "https://androidaps.readthedocs.io",
+        "apps": [
+          {
+            "package": "info.nightscout.androidaps"
+          }
+        ]
+      }
+    },
     "enableMultiJS": true,
     "targetPlatforms": [
       "emery"

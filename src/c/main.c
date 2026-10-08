@@ -1,4 +1,5 @@
 #include <pebble.h>
+#include "aaps_link.h"
 
 // ── Keys ─────────────────────────────────────────────────────────────────
 #define KEY_NS_URL          0
@@ -102,6 +103,11 @@ static char s_cgm_delta[16]   = "";
 static char s_cgm_trend[8]    = "-";
 static int  s_cgm_status      = CGM_STATUS_NO_CONN; // until first message arrives
 static time_t s_cgm_ts        = 0;   // reading timestamp; watch ages locally
+static time_t s_ns_ts         = 0;   // Nightscout reading timestamp, for the fetch watchdog
+static AapsLinkDisplay s_aaps;       // last AAPS display values (aaps_link)
+static bool   s_aaps_used     = false; // an AAPS glucose has been shown (kept in persist, so an
+                                       // AAPS-only face does not show "NO URL" after each start)
+#define PKEY_AAPS_USED 104             // next to PKEY_CFG..PKEY_LABELS (100-103) below
 static int  s_cgm_sgv         = 0;   // raw mg/dL for range comparison
 static int  s_show_seconds    = 0;   // 1=small seconds next to HH:MM
 static int  s_vibe_on_low     = 0;
@@ -155,14 +161,19 @@ static const char *cgm_status_text(void) {
   return NULL;
 }
 
+// A glucose source is set up: a Nightscout URL, or AAPS has sent a value.
+static bool cgm_has_source(void) {
+  return s_ns_url[0] != '\0' || s_aaps_used;
+}
+
 static bool cgm_is_fresh(void) {
-  return (strlen(s_ns_url) > 0) && (cgm_status_text() == NULL);
+  return cgm_has_source() && (cgm_status_text() == NULL);
 }
 
 static void complication_str(int slot, char *buf, size_t len) {
   switch (slot) {
     case 0: {
-      if (strlen(s_ns_url) == 0) { snprintf(buf, len, "----"); break; }
+      if (!cgm_has_source()) { snprintf(buf, len, "----"); break; }
       const char *st = cgm_status_text();
       if (st) snprintf(buf, len, "%s", st);
       else    snprintf(buf, len, "%s", s_cgm_value);
@@ -478,7 +489,7 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
       complication_str(s_complication, cstr, sizeof(cstr));
       cgm_slot  = (s_complication == 0);
       cgm_valid = cgm_slot && cgm_fresh;
-      creal     = (cgm_slot && strlen(s_ns_url) > 0) ? col_cgm : col_fg;
+      creal     = (cgm_slot && cgm_has_source()) ? col_cgm : col_fg;
     }
     graphics_context_set_stroke_color(ctx, PBL_IF_COLOR_ELSE(col_ghost, col_fg));
     graphics_context_set_stroke_width(ctx, 2);
@@ -615,7 +626,7 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
   {
     char l1[20], l2[32];
     int age = cgm_age_min();
-    if (strlen(s_ns_url) == 0) {
+    if (!cgm_has_source()) {
       snprintf(l1, sizeof(l1), "NO URL");     snprintf(l2, sizeof(l2), "CGM MONITOR");
     } else if (s_cgm_status == CGM_STATUS_NO_CONN) {
       snprintf(l1, sizeof(l1), "NO CONN");    snprintf(l2, sizeof(l2), "CGM MONITOR");
@@ -652,7 +663,15 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
 
   // ── 11. Yellow banner (editable bottom label) ─────────────────────────
   graphics_context_set_text_color(ctx, GColorYellow);
-  graphics_draw_text(ctx, s_label_bot, f_tiny, GRect(PX(4), y_ban + PY(2), W - PX(8), H - y_ban),
+  // AAPS IOB/COB in place of the default label while AAPS sends them (the link shows "--" after
+  // 15 min). A label the user set stays, and so does the label while the phone is not connected.
+  char ban[32];
+  if (strcmp(s_label_bot, "E-PAPER DISPLAY") == 0 && connection_service_peek_pebble_app_connection() &&
+      (strcmp(s_aaps.iob, "--") != 0 || strcmp(s_aaps.cob, "--") != 0))
+    snprintf(ban, sizeof(ban), "IOB %s  COB %s", s_aaps.iob, s_aaps.cob);
+  else
+    snprintf(ban, sizeof(ban), "%s", s_label_bot);
+  graphics_draw_text(ctx, ban, f_tiny, GRect(PX(4), y_ban + PY(2), W - PX(8), H - y_ban),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 
 #undef PX
@@ -681,12 +700,76 @@ static void accel_tap_handler(AccelAxisType axis, int32_t direction) {
 // ── Bluetooth connection ─────────────────────────────────────────────────
 // Phone/BT lost → show NOCON immediately instead of waiting for staleness.
 // On reconnect, ask the phone for a fresh BG right away.
-static void request_bg_fetch(void) {
+// False when the outbox is busy (e.g. an AAPS link snapshot is in flight).
+static bool request_bg_fetch(void) {
   DictionaryIterator *iter;
-  if (app_message_outbox_begin(&iter) == APP_MSG_OK) {
-    dict_write_uint8(iter, KEY_REQUEST_BG, 1);
-    app_message_outbox_send();
+  if (app_message_outbox_begin(&iter) != APP_MSG_OK) return false;
+  dict_write_uint8(iter, KEY_REQUEST_BG, 1);
+  return app_message_outbox_send() == APP_MSG_OK;
+}
+
+// ── AAPS link ─────────────────────────────────────────────────────────────
+// AAPS glucose text to mg/dL: a decimal mark means mmol/L with one decimal.
+// 0 for "---" or anything else that is not a number.
+static int aaps_bg_mgdl(const char *s) {
+  int whole = 0, tenth = -1, n = 0;
+  for (; *s; s++) {
+    if (*s >= '0' && *s <= '9') {
+      if (tenth == -2) { tenth = *s - '0'; continue; }
+      if (tenth >= 0) continue;
+      whole = whole * 10 + (*s - '0'); n++;
+    } else if ((*s == '.' || *s == ',') && n && tenth == -1) tenth = -2;
+    else return 0;
   }
+  if (!n || tenth == -2) return 0;
+  // rounded like the thresholds in pkjs (Math.round(mmol * 18))
+  return tenth >= 0 ? ((whole * 10 + tenth) * 18 + 5) / 10 : whole;
+}
+
+// AAPS trend text to the face's trend code (see draw_trend_arrow).
+static char aaps_trend_code(const char *t) {
+  if (!strcmp(t, "^^")) return 'U';
+  if (!strcmp(t, "^"))  return 'u';
+  if (!strcmp(t, "/"))  return 'r';
+  if (!strcmp(t, "\\")) return 'f';
+  if (!strcmp(t, "v"))  return 'd';
+  if (!strcmp(t, "vv")) return 'D';
+  return '-';
+}
+
+// Copies src into dst with ',' as '.', because the DSEG font has no comma.
+static void aaps_copy(char *dst, size_t len, const char *src) {
+  snprintf(dst, len, "%s", src);
+  for (char *p = dst; *p; p++) if (*p == ',') *p = '.';
+}
+
+// Puts the AAPS glucose into the face's CGM state when it is newer than what
+// is shown. Display only: low/high vibration and the fetch watchdog stay on
+// Nightscout, as the link carries no alarm.
+static void aaps_merge(void) {
+  aaps_link_display(&s_aaps);
+  if (s_aaps.age_min < 0 || !connection_service_peek_pebble_app_connection()) return;
+  // mg/dL from AAPS; parsing the text is only for an AAPS that does not send it yet
+  int sgv = s_aaps.bg_mgdl > 0 ? s_aaps.bg_mgdl : aaps_bg_mgdl(s_aaps.bg);
+  if (sgv <= 0) return;
+  time_t ts = s_aaps.bg_time;
+  if (ts < s_cgm_ts) return;
+  aaps_copy(s_cgm_value, sizeof(s_cgm_value), s_aaps.bg);
+  aaps_copy(s_cgm_delta, sizeof(s_cgm_delta), s_aaps.delta);
+  s_cgm_trend[0] = aaps_trend_code(s_aaps.trend);
+  s_cgm_trend[1] = '\0';
+  s_cgm_sgv = sgv;
+  s_cgm_ts = ts;
+  s_cgm_status = CGM_STATUS_OK;
+  if (!s_aaps_used) {
+    s_aaps_used = true;
+    persist_write_bool(PKEY_AAPS_USED, true);  // once, not on every merge
+  }
+}
+
+static void aaps_show(void) {
+  aaps_merge();
+  if (s_canvas) layer_mark_dirty(s_canvas);
 }
 
 // Vibrate on threshold breach, 10-minute cooldown per direction (supercgm)
@@ -711,6 +794,9 @@ static void check_bg_alerts(void) {
   }
 }
 
+// The fetch asked for on reconnect could not be sent (busy outbox): bg_watchdog sends it.
+static bool s_fetch_owed = false;
+
 static void app_connection_handler(bool connected) {
   if (!connected) {
     s_cgm_status = CGM_STATUS_NO_CONN;
@@ -719,7 +805,8 @@ static void app_connection_handler(bool connected) {
     s_cgm_trend[0] = '\0';
     vibes_short_pulse();  // single buzz so user notices disconnect
   } else {
-    request_bg_fetch();
+    s_fetch_owed = s_ns_url[0] != '\0' && !request_bg_fetch();
+    aaps_merge();  // the link still holds a fresh AAPS value: show it again at once
   }
   if (s_canvas) layer_mark_dirty(s_canvas);
 }
@@ -736,14 +823,20 @@ static void bg_watchdog(void) {
   time_t now = time(NULL);
   int interval_sec = s_ns_stale_min * 30;  // stale = 2x sensor interval
   if (interval_sec < 60) interval_sec = 60;
-  if (now - s_cgm_ts < interval_sec + 180 || now - s_last_bg_req_ts < 180) return;
+  if (s_ns_url[0] == '\0') return;  // no Nightscout (AAPS only): no fetch chain to wake
   if (!connection_service_peek_pebble_app_connection()) return;
-  s_last_bg_req_ts = now;
-  request_bg_fetch();
+  if (s_fetch_owed) {
+    if (request_bg_fetch()) { s_fetch_owed = false; s_last_bg_req_ts = now; }
+    return;
+  }
+  // Nightscout time, not the shown one: a fresh AAPS value must not hide a stalled fetch chain
+  if (now - s_ns_ts < interval_sec + 180 || now - s_last_bg_req_ts < 180) return;
+  if (request_bg_fetch()) s_last_bg_req_ts = now;  // busy outbox: try again next minute
 }
 
 static void tick_handler(struct tm *tick_time, TimeUnits units) {
   if (units & MINUTE_UNIT) {
+    aaps_merge();
     bg_watchdog();
 #if defined(PBL_HEALTH)
     HealthServiceAccessibilityMask m;
@@ -808,10 +901,10 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
   GS(KEY_CGM_TREND,s_cgm_trend);
   GI(KEY_CGM_SGV,s_cgm_sgv);
   if ((t = dict_find(iter, KEY_CGM_TS))) {
-    s_cgm_ts = (time_t)t->value->int32;
+    s_cgm_ts = s_ns_ts = (time_t)t->value->int32;
   } else if ((t = dict_find(iter, KEY_CGM_AGE))) {
     // Fallback for messages without a timestamp: derive it from the age
-    s_cgm_ts = time(NULL) - (time_t)t->value->int32 * 60;
+    s_cgm_ts = s_ns_ts = time(NULL) - (time_t)t->value->int32 * 60;
   }
   if ((t = dict_find(iter, KEY_CGM_STATUS))) {
     s_cgm_status = (int)t->value->int32;
@@ -831,6 +924,7 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
   // Persist only config messages (avoid flash wear on every 5-min CGM push);
   // config messages always carry KEY_COLOR_BG, data messages never do.
   if (dict_find(iter, KEY_COLOR_BG)) save_persist();
+  aaps_merge();  // an older Nightscout reading must not replace a newer AAPS one
   if (s_canvas) layer_mark_dirty(s_canvas);
 }
 
@@ -1010,6 +1104,7 @@ static void window_unload(Window *w) {
 // ── App lifecycle ─────────────────────────────────────────────────────────
 static void init(void) {
   load_persist();
+  s_aaps_used = persist_read_bool(PKEY_AAPS_USED);
   battery_state_service_subscribe(battery_state_handler);
   s_batt_pct = (int)battery_state_service_peek().charge_percent;
   s_window = window_create();
@@ -1030,6 +1125,9 @@ static void init(void) {
                      out_max < 256u ? out_max : 256u);
   }
   app_message_register_inbox_received(inbox_received);
+  aaps_link_init();               // steps/HR to AAPS, AAPS glucose/IOB/COB back
+  aaps_link_on_display(aaps_show);
+  aaps_merge();                   // fills s_aaps ("--") before the first draw
 }
 
 static void deinit(void) {
